@@ -45,7 +45,7 @@ std::string toHexDigits(std::uint32_t value, int digits) {
 
 std::string binToNumberLiterals(const std::vector<std::uint32_t>& bin, int digits) {
 	std::string result;
-	result.reserve(bin.size()*(digits+3));
+	result.reserve(bin.size()*(digits+3)); // +3 for " 0x"
 
 	for (std::uint32_t value : bin)
 		result.append(" 0x").append(toHexDigits(value, digits));
@@ -76,10 +76,16 @@ void run(const RunConfig& config) {
 	std::size_t inputSize = std::ftell(input);
 	std::fseek(input, 0, SEEK_SET);
 
+	// Ensuring non-empty input file
+	if (inputSize == 0) {
+		std::fclose(input);
+		throw std::runtime_error(std::string("Input file is empty"));
+	}
+
 	// Ensuring data size is compatible with EA output type
 	if (inputSize & (config.outType-1)) {
 		std::fclose(input);
-		throw std::runtime_error(std::string("Input size and Output type are incompatible"));
+		throw std::runtime_error(std::string("Input file size is not divisible by output type"));
 	}
 
 	rawData.resize(inputSize);
@@ -195,7 +201,7 @@ int main(int argc, char** argv) {
 
 		run(config);
 	} catch (const std::exception& e) {
-		std::fprintf(stderr, "[bin2ea error] %s", e.what());
+		std::fprintf(stderr, "[bin2ea error] %s\n", e.what());
 		return 1;
 	}
 
