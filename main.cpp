@@ -1,18 +1,34 @@
-#include <cstdio>
 #include <cstring>
+
 #include <string>
 #include <stdexcept>
+#include <iostream>
+#include <fstream>
 
 #include "util/args.h"
 
-enum OutputType {
-	OutByte  = 1,
-	OutShort = 2,
-	OutWord  = 4
+#include "lib/hex_convert.h"
+#include "lib/byte_pack.h"
+
+struct output_definition {
+	const char* code;
+	std::size_t bytes;
 };
 
-struct RunConfig {
-	OutputType outType = OutByte;
+enum output_category {
+	OUT_BYTE,
+	OUT_SHORT,
+	OUT_WORD,
+};
+
+static const output_definition eaOutDefinitions[] {
+	{ "BYTE",  1 }, // OUT_BYTE
+	{ "SHORT", 2 }, // OUT_SHORT
+	{ "WORD",  4 }, // OUT_WORD
+};
+
+struct bin2ea_config {
+	output_category outType = OUT_WORD;
 	bool toStdOut = false;
 	bool toDefine = false;
 	bool newLine = true;
@@ -25,139 +41,174 @@ struct RunConfig {
 	std::string inputFileName;
 };
 
-std::string::value_type toHexDigit(std::uint32_t value) {
-	value = (value & 0xF);
-
-	if (value < 10)
-		return '0' + value;
-	return 'A' + (value - 10);
+/*
+std::size_t predict_ea_code_capacity(std::size_t count, output_category type) {
+	return std::strlen(eaOutDefinitions[type].code) + count * (eaOutDefinitions[type].bytes*2 + 2);
 }
 
-std::string toHexDigits(std::uint32_t value, int digits) {
-	std::string result;
-	result.resize(digits);
-
-	for (int i=0; i<digits; ++i)
-		result[digits-i-1] = toHexDigit(value >> (4*i));
-
-	return result;
+template<typename IntIteratorType>
+std::size_t predict_ea_code_capacity(IntIteratorType begin, IntIteratorType end, output_category type) {
+	return predict_ea_code_capacity(std::distance(begin, end), type);
 }
 
-std::string binToNumberLiterals(const std::vector<std::uint32_t>& bin, int digits) {
-	std::string result;
-	result.reserve(bin.size()*(digits+3)); // +3 for " 0x"
+template<typename ByteIteratorType>
+std::size_t predict_ea_bytes_capacity(ByteIteratorType begin, ByteIteratorType end, output_category type) {
+	std::size_t size = std::distance(begin, end);
+	std::size_t result = predict_ea_code_capacity(size / eaOutDefinitions[type].bytes, type);
+	std::size_t remains = size % eaOutDefinitions[type].bytes;
 
-	for (std::uint32_t value : bin)
-		result.append(" 0x").append(toHexDigits(value, digits));
+	if (!remains)
+		return result;
 
-	return result;
+	return result + predict_ea_code_capacity(remains, OUT_BYTE) + 1;
+}
+//*/
+
+template<typename OutputIteratorType, typename InputIteratorType>
+OutputIteratorType write_range(OutputIteratorType out, InputIteratorType begin, InputIteratorType end) {
+	return std::copy(begin, end, out);
 }
 
-std::string binToEACode(const std::vector<std::uint32_t>& bin, OutputType type) {
-	std::string result;
-
-	result.append((type == OutByte) ? "BYTE" : ((type == OutShort) ? "SHORT" : "WORD"));
-	result.append(binToNumberLiterals(bin, (int) type*2));
-
-	return result;
+template<typename OutputIteratorType, typename CharType>
+OutputIteratorType write_cstring(OutputIteratorType out, const CharType* cstring) {
+	while (*cstring)
+		*(out++) = *(cstring++);
+	return out;
 }
 
-void run(const RunConfig& config) {
-	std::FILE* input  = nullptr;
-	std::FILE* output = nullptr;
+template<typename OutputIteratorType, typename CharType>
+OutputIteratorType write_char(OutputIteratorType out, CharType chr) {
+	return *out++ = chr, out;
+}
 
-	std::vector<std::uint8_t> rawData;
-	std::vector<std::uint32_t> convertedData;
+template<typename OutputIteratorType, typename IntegerType>
+OutputIteratorType write_ea_number(OutputIteratorType out, IntegerType value) {
+	return hex_convert<IntegerType>::write_digits(write_char(out, '$'), value);
+}
 
-	if (!(input = std::fopen(config.inputFileName.c_str(), "rb")))
-		throw std::runtime_error(std::string("Couldn't open file for read: ").append(config.inputFileName));
+template<typename OutputIteratorType, typename IntIteratorType>
+OutputIteratorType write_ea_numbers(OutputIteratorType out, IntIteratorType begin, IntIteratorType end) {
+	for (auto it = begin; it != end; ++it)
+		out = write_ea_number(write_char(out, ' '), *it);
 
-	std::fseek(input, 0, SEEK_END);
-	std::size_t inputSize = std::ftell(input);
-	std::fseek(input, 0, SEEK_SET);
+	return out;
+}
 
-	// Ensuring non-empty input file
-	if (inputSize == 0) {
-		std::fclose(input);
-		throw std::runtime_error(std::string("Input file is empty"));
+template<typename OutputIteratorType, typename IntIteratorType>
+OutputIteratorType write_ea_code(OutputIteratorType out, IntIteratorType begin, IntIteratorType end, output_category type) {
+	out = write_cstring(out, eaOutDefinitions[type].code);
+	out = write_ea_numbers(out, begin, end);
+
+	return out;
+}
+
+template<typename OutputIteratorType, typename ByteIteratorType>
+OutputIteratorType write_ea_bytes(OutputIteratorType out, ByteIteratorType begin, ByteIteratorType end, output_category type) {
+	auto itAlign = end;
+	while (std::distance(begin, itAlign) % eaOutDefinitions[type].bytes)
+		itAlign--;
+
+	out = write_ea_code(out,
+		byte_packer<std::uint32_t>(begin,   eaOutDefinitions[type].bytes),
+		byte_packer<std::uint32_t>(itAlign, eaOutDefinitions[type].bytes),
+	type);
+
+	if (itAlign != end)
+		out = write_ea_code(write_char(out, ';'), itAlign, end, OUT_BYTE);
+
+	return out;
+}
+
+template<typename OutputIteratorType, typename WriteNameFuncType, typename WriteContentFuncType>
+OutputIteratorType write_ea_definition(OutputIteratorType out, WriteNameFuncType writeName, WriteContentFuncType writeContent) {
+	out = write_cstring(out, "#define ");
+	out = writeName(out);
+	out = write_cstring(out, " \"");
+	out = writeContent(out);
+	out = write_cstring(out, "\"");
+}
+
+template<typename OutputIteratorType, typename WriteNameFuncType, typename WriteContentFuncType>
+OutputIteratorType write_ea_labelled(OutputIteratorType out, WriteNameFuncType writeName, WriteContentFuncType writeContent) {
+	out = writeName(out);
+	out = write_cstring(out, ":\n\t");
+	out = writeContent(out);
+}
+
+void run(const bin2ea_config& config) {
+	std::vector<std::uint8_t> data; {
+		std::ifstream inputStream;
+
+		if (!(inputStream.open(config.inputFileName, std::ios::in | std::ios::binary), inputStream.is_open()))
+			throw std::runtime_error(std::string("Couldn't open file for read: ").append(config.inputFileName));
+
+		inputStream.seekg(0, std::ios::end);
+		std::size_t inputSize = inputStream.tellg();
+
+		if (!inputSize)
+			throw std::runtime_error(std::string("Input file is empty"));
+
+		data.resize(inputSize);
+
+		inputStream.seekg(0);
+		inputStream.read(reinterpret_cast<char*>(data.data()), inputSize);
 	}
 
-	// Ensuring data size is compatible with EA output type
-	if (inputSize & (config.outType-1)) {
-		std::fclose(input);
-		throw std::runtime_error(std::string("Input file size is not divisible by output type"));
-	}
+	using input_iterator_type = std::ostream_iterator<char>;
 
-	rawData.resize(inputSize);
-	std::fread(rawData.data(), 1, inputSize, input);
+	auto writeContent = [&data, &config] (input_iterator_type it) -> input_iterator_type {
+		if (config.before.size())
+			it = write_char(write_range(it, config.before.begin(), config.before.end()), ';');
 
-	std::fclose(input);
+		it = write_ea_bytes(it, data.begin(), data.end(), config.outType);
 
-	inputSize = (inputSize / config.outType);
-	convertedData.reserve(inputSize);
+		if (config.after.size())
+			it = write_range(write_char(it, ';'), config.after.begin(), config.after.end());
 
-	for (std::size_t i=0; i<inputSize; ++i) {
-		std::uint32_t currentData = 0;
+		return it;
+	};
 
-		for (std::size_t j=0; j<config.outType; ++j)
-			currentData |= ((rawData.at(i*config.outType + j)) << (j*8));
+	auto writeName = [&config] (input_iterator_type it) -> input_iterator_type {
+		return write_range(it, config.labelName.begin(), config.labelName.end());
+	};
 
-		convertedData.push_back(currentData);
-	}
-
-	std::string outEACode = binToEACode(convertedData, config.outType);
-
-	std::string outEA;
-	outEA.reserve(outEACode.size() + 256); // who cares, just make it fast
-
-	if (!config.labelName.empty()) {
-		if (config.toDefine) {
-			outEA.append("#define ");
-			outEA.append(config.labelName);
-			outEA.append(" \"");
-		} else {
-			outEA.append(config.labelName);
-			outEA.append(":\n\t");
-		}
-	}
-
-	if (!config.before.empty())
-		outEA.append(config.before).append("; ");
-
-	outEA.append(outEACode);
-
-	if (!config.after.empty())
-		outEA.append("; ").append(config.after);
-
-	if (config.toDefine)
-		outEA.append("\"\n");
-	else if (config.newLine)
-		outEA.append("\n");
+	auto writeAll = [&config, &writeName, &writeContent] (input_iterator_type it) -> input_iterator_type {
+		if (config.labelName.empty())
+			return writeContent(it);
+		else if (config.toDefine)
+			return write_ea_definition(it, writeName, writeContent);
+		else
+			return write_ea_labelled(it, writeName, writeContent);
+	};
 
 	if (config.toStdOut)
-		output = stdout;
-	else if (!(output = std::fopen(config.outputFileName.c_str(), "w")))
-		throw std::runtime_error(std::string("Couldn't open file for write: ").append(config.outputFileName));
+		writeAll(std::ostream_iterator<char>(std::cout));
+	else {
+		std::ofstream outputStream;
 
-	std::fwrite(outEA.c_str(), 1, outEA.size(), output);
+		if (!(outputStream.open(config.outputFileName), outputStream.is_open()))
+			throw std::runtime_error(std::string("Couldn't open file for write: ").append(config.outputFileName));
 
-	if (!config.toStdOut)
-		std::fclose(output);
+		writeAll(std::ostream_iterator<char>(outputStream));
+	}
 }
 
 int main(int argc, char** argv) {
+	// TODO: change the way arguments are parsed, because this is kinda bad
 	Arguments args(argc, argv);
 
 	if (argc == 1) {
-		// Show Help
-		std::printf("Usage: %s <input> [output/--to-stdout] [-byte/-short/-word] [-define <name>/-label <name>] [-before <before>] [-after <after>] [-no-newline]\n", args.peek().value);
+		std::cout << "Usage: " << argv[0]
+				  << " <input> [output/--to-stdout] [-byte/-short/-word] [-define <name>/-label <name>] [-before <before>] [-after <after>] [-no-newline]"
+				  << std::endl;
+
 		return 0;
 	}
 
 	try {
-		RunConfig config;
+		bin2ea_config config;
 
-		auto nextString = [&args] () -> char* {
+		auto nextString = [&args] () -> const char* {
 			Argument result = args.next();
 
 			if (result.type == Argument::End)
@@ -173,11 +224,11 @@ int main(int argc, char** argv) {
 				if (!std::strcmp(arg.value, "-to-stdout"))
 					config.toStdOut = true;
 				else if (!std::strcmp(arg.value, "byte"))
-					config.outType = OutByte;
+					config.outType = OUT_BYTE;
 				else if (!std::strcmp(arg.value, "short"))
-					config.outType = OutShort;
+					config.outType = OUT_SHORT;
 				else if (!std::strcmp(arg.value, "word"))
-					config.outType = OutWord;
+					config.outType = OUT_WORD;
 				else if (!std::strcmp(arg.value, "no-newline"))
 					config.newLine = false;
 				else if (!std::strcmp(arg.value, "before"))
@@ -201,7 +252,7 @@ int main(int argc, char** argv) {
 
 		run(config);
 	} catch (const std::exception& e) {
-		std::fprintf(stderr, "[bin2ea error] %s\n", e.what());
+		std::cerr << "BIN2EA ERROR - " << e.what() << std::endl;
 		return 1;
 	}
 
